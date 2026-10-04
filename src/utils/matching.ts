@@ -1,4 +1,31 @@
-import type { ArchiveRecord, FieldKey, MatchCandidate } from '../types';
+import type { DecisionBasis, FieldKey, RecordGroup, SignatureSlim } from '../types';
+
+/** 与存储模型解耦的最小记录形状，使评分规则可在 Node 下直接测试。 */
+export interface RecordLike {
+  id: string;
+  group: RecordGroup;
+  title: string;
+  date: string;
+  people: string[];
+  places: string[];
+  identifier: string;
+  medium: string;
+  extent: string;
+  rights: string;
+  notes: string;
+}
+
+export const FIELD_KEYS: FieldKey[] = [
+  'title', 'date', 'people', 'places', 'identifier',
+  'medium', 'extent', 'rights', 'notes'
+];
+
+/** 触发“现行规则重算”的四个关键字段。 */
+export const SIGNATURE_FIELDS = ['title', 'date', 'people', 'places'] as const;
+export type SignatureField = (typeof SIGNATURE_FIELDS)[number];
+
+export const SCORE_THRESHOLD = 0.38;
+export const LOW_SCORE = 0.68;
 
 const normalize = (value: string) => value.toLowerCase().replace(/[\s·,，。:：;；()（）\-_/]/g, '');
 const chars = (value: string) => {
@@ -35,13 +62,32 @@ const exactish = (left: string, right: string) => {
   if (a.includes(b) || b.includes(a)) return Math.min(a.length, b.length) / Math.max(a.length, b.length) + 0.15;
   return dice(a, b);
 };
-const displayValue = (record: ArchiveRecord, field: FieldKey) => {
-  const value = record[field];
-  return Array.isArray(value) ? value.join('、') : String(value);
-};
 
-export function scorePair(left: ArchiveRecord, right: ArchiveRecord) {
-  const fieldScores: Record<FieldKey, number> = {
+export function fieldText(record: Pick<RecordLike, FieldKey>, field: FieldKey): string {
+  const value = record[field];
+  return Array.isArray(value) ? value.filter(Boolean).join('、') : String(value ?? '');
+}
+
+/** 三方比对所用的规范化值：数组字段排序去重，文本字段 trim。 */
+export function canonicalText(record: Pick<RecordLike, FieldKey>, field: FieldKey): string {
+  if (field === 'people' || field === 'places') {
+    return [...new Set(record[field].map((item) => item.trim()).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b, 'zh-CN')).join('|');
+  }
+  return (record[field] as string).trim();
+}
+
+export function signatureSlim(record: Pick<RecordLike, FieldKey>): SignatureSlim {
+  return {
+    title: canonicalText(record, 'title'),
+    date: canonicalText(record, 'date'),
+    people: canonicalText(record, 'people'),
+    places: canonicalText(record, 'places')
+  };
+}
+
+export function scorePair(left: RecordLike, right: RecordLike): Omit<DecisionBasis, 'left' | 'right'> {
+  const fieldScores: Partial<Record<FieldKey, number>> = {
     title: exactish(left.title, right.title),
     date: exactish(left.date, right.date),
     people: jaccard(left.people, right.people),
@@ -52,41 +98,53 @@ export function scorePair(left: ArchiveRecord, right: ArchiveRecord) {
     rights: exactish(left.rights, right.rights),
     notes: exactish(left.notes, right.notes)
   };
-  const score = fieldScores.title * .3 + fieldScores.date * .2 + fieldScores.people * .2 + fieldScores.places * .14 + fieldScores.identifier * .16;
+  const score = fieldScores.title! * .3 + fieldScores.date! * .2 + fieldScores.people! * .2
+    + fieldScores.places! * .14 + fieldScores.identifier! * .16;
   const reasons: string[] = [];
-  if (fieldScores.identifier > .8) reasons.push('编号高度一致');
-  if (fieldScores.title > .58) reasons.push('标题相似');
-  if (fieldScores.date > .9) reasons.push('日期一致');
-  if (fieldScores.people > .8) reasons.push('人物一致');
-  if (fieldScores.places > .6) reasons.push('地点相近');
+  if (fieldScores.identifier! > .8) reasons.push('编号高度一致');
+  if (fieldScores.title! > .58) reasons.push('标题相似');
+  if (fieldScores.date! > .9) reasons.push('日期一致');
+  if (fieldScores.people! > .8) reasons.push('人物一致');
+  if (fieldScores.places! > .6) reasons.push('地点相近');
   if (!reasons.length) reasons.push('组合字段达到匹配阈值');
   return { score: Math.min(1, score), fieldScores, reasons };
 }
 
-export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
-  const left = records.filter((record) => record.group === 'A');
-  const right = records.filter((record) => record.group === 'B');
-  const matches: MatchCandidate[] = [];
-  left.forEach((a) => {
-    const candidates = right.map((b) => ({ record: b, ...scorePair(a, b) }))
-      .filter((item) => item.score >= .38)
-      .sort((x, y) => y.score - x.score)
-      .slice(0, 4);
-    candidates.forEach((candidate) => {
-      matches.push({
-        id: `match-${a.id}-${candidate.record.id}`,
-        leftId: a.id,
-        rightId: candidate.record.id,
-        score: candidate.score,
-        fieldScores: candidate.fieldScores,
-        status: 'suggested',
-        reasons: candidate.reasons
-      });
-    });
-  });
-  return matches.sort((a, b) => b.score - a.score);
+export function decisionBasis(left: RecordLike, right: RecordLike): DecisionBasis {
+  return { ...scorePair(left, right), left: signatureSlim(left), right: signatureSlim(right) };
 }
 
-export function fieldValue(record: ArchiveRecord, field: FieldKey): string {
-  return displayValue(record, field);
+export const matchKey = (leftId: string, rightId: string) => `match:${leftId}:${rightId}`;
+
+/** 现行规则：按组配对、限制每侧候选数。键名以 A 在前 B 在后，保证跨批次稳定。 */
+export function buildCandidates(
+  records: Array<RecordLike & { supersededBy?: string }>
+): Map<string, DecisionBasis> {
+  const alive = records.filter((record) => !record.supersededBy);
+  const left = alive.filter((record) => record.group === 'A');
+  const right = alive.filter((record) => record.group === 'B');
+  const result = new Map<string, DecisionBasis>();
+  left.forEach((a) => {
+    const candidates = right
+      .map((b) => ({ record: b, basis: decisionBasis(a, b) }))
+      .filter((item) => item.basis.score >= SCORE_THRESHOLD)
+      .sort((x, y) => y.basis.score - x.basis.score)
+      .slice(0, 4);
+    candidates.forEach(({ record, basis }) => result.set(matchKey(a.id, record.id), basis));
+  });
+  return result;
+}
+
+/** 判断已裁决结论的旧依据是否与当前关键字段相符（决定是否退回待复核）。 */
+export function basisStillValid(
+  basis: DecisionBasis,
+  left: Pick<RecordLike, FieldKey>,
+  right: Pick<RecordLike, FieldKey>
+): boolean {
+  const nowLeft = signatureSlim(left);
+  const nowRight = signatureSlim(right);
+  return basis.left.title === nowLeft.title && basis.left.date === nowLeft.date
+    && basis.left.people === nowLeft.people && basis.left.places === nowLeft.places
+    && basis.right.title === nowRight.title && basis.right.date === nowRight.date
+    && basis.right.people === nowRight.people && basis.right.places === nowRight.places;
 }
