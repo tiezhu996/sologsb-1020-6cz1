@@ -1,4 +1,8 @@
 import type { ArchiveRecord, FieldKey, MatchCandidate } from '../types';
+import { RULE_VERSION } from '../version/core';
+
+export const MATCH_THRESHOLD = 0.38;
+export const LOW_SCORE = 0.68;
 
 const normalize = (value: string) => value.toLowerCase().replace(/[\s·,，。:：;；()（）\-_/]/g, '');
 const chars = (value: string) => {
@@ -63,30 +67,50 @@ export function scorePair(left: ArchiveRecord, right: ArchiveRecord) {
   return { score: Math.min(1, score), fieldScores, reasons };
 }
 
+export const matchPairId = (leftId: string, rightId: string) => `match::${leftId}::${rightId}`;
+
+/** 按现行规则对全体 A/B 记录计算候选（每条 A 保留前 4 个达标对）。合并记录不参与。 */
 export function computeMatches(records: ArchiveRecord[]): MatchCandidate[] {
-  const left = records.filter((record) => record.group === 'A');
-  const right = records.filter((record) => record.group === 'B');
+  const left = records.filter((record) => record.group === 'A' && record.status !== 'merged');
+  const right = records.filter((record) => record.group === 'B' && record.status !== 'merged');
   const matches: MatchCandidate[] = [];
   left.forEach((a) => {
     const candidates = right.map((b) => ({ record: b, ...scorePair(a, b) }))
-      .filter((item) => item.score >= .38)
+      .filter((item) => item.score >= MATCH_THRESHOLD)
       .sort((x, y) => y.score - x.score)
       .slice(0, 4);
     candidates.forEach((candidate) => {
       matches.push({
-        id: `match-${a.id}-${candidate.record.id}`,
+        id: matchPairId(a.id, candidate.record.id),
         leftId: a.id,
         rightId: candidate.record.id,
         score: candidate.score,
         fieldScores: candidate.fieldScores,
         status: 'suggested',
-        reasons: candidate.reasons
+        reasons: candidate.reasons,
+        ruleVersion: RULE_VERSION
       });
     });
   });
   return matches.sort((a, b) => b.score - a.score);
 }
 
-export function fieldValue(record: ArchiveRecord, field: FieldKey): string {
+/** 对单个记录对评分，生成/刷新候选（不限阈值，由调用方决定保留与否）。 */
+export function scoreCandidate(left: ArchiveRecord, right: ArchiveRecord): MatchCandidate {
+  const result = scorePair(left, right);
+  return {
+    id: matchPairId(left.id, right.id),
+    leftId: left.id,
+    rightId: right.id,
+    score: result.score,
+    fieldScores: result.fieldScores,
+    status: 'suggested',
+    reasons: result.reasons,
+    ruleVersion: RULE_VERSION
+  };
+}
+
+export function fieldValue(record: ArchiveRecord | undefined, field: FieldKey): string {
+  if (!record) return '';
   return displayValue(record, field);
 }
